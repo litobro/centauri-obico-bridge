@@ -96,6 +96,9 @@ class BasePrinter:
         # that /webcam/snapshot does not open a new printer stream per request.
         self.latest_frame: bytes = b""
         self.latest_frame_ts: float = 0.0
+        # Seconds without camera data before the reader drops the upstream
+        # connection and reconnects (the printer can leave it open but silent).
+        self.frame_read_timeout: float = 15.0
         self._raw_fh = None
 
     # -- raw logging ------------------------------------------------------- #
@@ -279,7 +282,8 @@ class BasePrinter:
             try:
                 await self.prepare_video()
                 buf = bytearray()
-                async with httpx.AsyncClient(timeout=None) as client:
+                timeout = httpx.Timeout(10.0, read=self.frame_read_timeout)
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     async with client.stream("GET", self.video_url) as upstream:
                         async for chunk in upstream.aiter_bytes():
                             buf.extend(chunk)
@@ -299,6 +303,11 @@ class BasePrinter:
                                 del buf[:end + 2]
             except asyncio.CancelledError:
                 raise
+            except httpx.ReadTimeout:
+                log.warning(
+                    "camera stream sent nothing for %.0fs; reconnecting", self.frame_read_timeout
+                )
+                await asyncio.sleep(2)
             except Exception as exc:
                 log.debug("frame reader error: %s", exc)
                 await asyncio.sleep(2)

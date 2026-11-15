@@ -8,6 +8,7 @@ deltas (event 6000) that followed.  Serial and IP are anonymised.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -345,3 +346,49 @@ def test_files_directory_for_obico_file_browser(cc2_app):
 
     assert client.get("/server/files/directory", params={"path": "gcodes/nope"}).status_code == 404
     assert client.get("/server/files/directory", params={"path": "config"}).status_code == 404
+
+
+def test_frame_reader_reconnects_when_upstream_stalls(cc2_app, monkeypatch):
+    # The printer's MJPEG socket can go silent without closing. The reader must
+    # notice and reconnect, otherwise /webcam/snapshot and /webcam/stream serve
+    # the same frozen frame forever.
+    bridge = cc2_app.make_bridge()
+    bridge.frame_read_timeout = 0.3
+    connections = []
+
+    async def prepare_video():
+        return None
+
+    bridge.prepare_video = prepare_video
+
+    async def handle(reader, writer):
+        connections.append(writer)
+        await reader.readuntil(b"\r\n\r\n")
+        n = len(connections)
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace;boundary=b\r\n\r\n"
+            b"--b\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8frame%d\xff\xd9\r\n" % n
+        )
+        await writer.drain()
+        await asyncio.sleep(30)  # stall with the socket open
+
+    async def run():
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(type(bridge), "video_url", f"http://127.0.0.1:{port}/?action=stream")
+        task = asyncio.create_task(bridge.frame_reader())
+        try:
+            for _ in range(100):
+                if bridge.latest_frame == b"\xff\xd8frame2\xff\xd9":
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            for w in connections:
+                w.close()
+            server.close()
+
+    asyncio.run(run())
+    assert bridge.latest_frame == b"\xff\xd8frame2\xff\xd9"
